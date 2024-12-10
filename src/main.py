@@ -6,7 +6,9 @@ import talib as ta
 import numpy as np
 import os
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Definição de todas as funções no nível superior
 
 def get_cache_filename_for_candles(timeframe_str):
     return f"candles_{timeframe_str}.parquet"
@@ -55,24 +57,25 @@ def read_and_cache_candles(df, timeframe_str):
 
 def create_candles(df, timeframe_str):
     units_map = {
-        'min': 'min',
-        'h': 'h',
-        'd': 'd',
-        'w': 'w',
-        'm': 'm',
-        'y': 'y'
+        'min': 'T',  # 'T' é o alias do pandas para minutos
+        'h': 'H',
+        'd': 'D',
+        'w': 'W',
+        'm': 'M',
+        'y': 'Y'
     }
 
     tf_str = timeframe_str.lower().strip()
     match = re.match(r"(\d+)([a-zA-Z]+)", tf_str)
     if not match:
-        raise ValueError("Formato de timeframe inválido.")
+        raise ValueError("Formato de timeframe inválido. Exemplo: '210min', '1H', etc.")
     value, unit = match.groups()
     unit = unit.lower()
     if unit not in units_map:
         raise ValueError(f"Unidade de timeframe não suportada: {unit}")
 
     pandas_tf = value + units_map[unit]
+    print(f"Iniciando resampling com frequência: {pandas_tf}")
 
     df = df.set_index("Date").sort_index()
     candles = df.resample(pandas_tf).agg({
@@ -82,6 +85,8 @@ def create_candles(df, timeframe_str):
         'Close': 'last',
         'Volume': 'sum'
     }).dropna(how='any')
+
+    print("Resampling concluído.")
     return candles
 
 def format_duration_minutes(duration_minutes):
@@ -117,8 +122,8 @@ def alma(data, period, offset=0.85, sigma=6):
     m = (offset * (period - 1))
     s = period/sigma
     wts = [np.exp(-((i - m)**2)/(2*s*s)) for i in range(period)]
-    wts = wts/np.sum(wts)
-    res = data.rolling(period).apply(lambda x: np.sum(x*wts), raw=True)
+    wts = wts / np.sum(wts)
+    res = data.rolling(period).apply(lambda x: np.sum(x * wts), raw=True)
     return res
 
 def wilders(data, period):
@@ -178,7 +183,7 @@ def create_ma_line(data, ma_type='SMA', period=14):
 
     try:
         ma_result = ma_functions[ma_type](data, period)
-    except Exception:
+    except Exception as e:
         ma_result = np.full(len(data), np.nan)
 
     if not isinstance(ma_result, pd.Series):
@@ -190,69 +195,40 @@ def run_strategy(
     candles,
     initial_capital=100.0,
     used_capital_pct=0.4,
-    leverage=5,  # Alavancagem fixa
+    leverage=7,  # Alavancagem fixa
     ma_type='SMA',
     ma_period=2,
     buy_condition=lambda prev_obv, prev_ma, current_obv, current_ma: (prev_obv > prev_ma and current_obv < current_ma),
     sell_condition=lambda prev_obv, prev_ma, current_obv, current_ma: (prev_obv < prev_ma and current_obv > current_ma),
     stop_pct=0.017,
-    taker_fee=0.0004,
-    previous_trades=None
+    taker_fee=0.0004
 ):
-
-    MAX_CAPITAL = 1e12
-    MAX_NO_TRADE_STEPS = 100000
-
-    if previous_trades is None:
-        previous_trades = []
-
-    close = candles['Close'].astype(float)
-    volume = candles['Volume'].astype(float)
-    high = candles['High'].astype(float)
-    low = candles['Low'].astype(float)
+    close = candles['Close'].astype('float64')
+    volume = candles['Volume'].astype('float64')
+    high = candles['High'].astype('float64')
+    low = candles['Low'].astype('float64')
 
     obv = pd.Series(ta.OBV(close.values, volume.values), index=close.index)
     ma_line = create_ma_line(obv, ma_type=ma_type, period=ma_period)
 
-    position = 0
+    position = 0  # 0: sem posição, 1: Long, -1: Short
     capital = initial_capital
     trades = []
+    liquidations = 0  # Contador de liquidações
 
     entry_price = None
     entry_date = None
     stop_loss = None
     qty = None
     allocated_capital = None
-    current_position_leverage = leverage
 
-    max_price = None
-    min_price = None
-
-    no_trade_steps = 0
-
-    def check_liquidation(position_type, entry_price, max_price, min_price, current_position_leverage):
-        if position_type == 1:
-            drawdown_pct = (entry_price - min_price)/entry_price*100 if entry_price != 0 else 0
-            if drawdown_pct >= 100/current_position_leverage:
-                return True, 'Long'
-        if position_type == -1:
-            drawup_pct = (max_price - entry_price)/entry_price*100 if entry_price != 0 else 0
-            if drawup_pct >= 100/current_position_leverage:
-                return True, 'Short'
-        return False, None
-
-    def safe_alloc_cap(cap, used_cap_pct, lev):
-        val = cap * used_cap_pct * lev
-        if np.isinf(val) or np.isnan(val) or val > MAX_CAPITAL:
-            return None
-        return val
+    # Variáveis para Trailing Stop
+    trailing_step = 0  # Incremento de 1% de lucro
+    last_trailing_update = 0  # Último nível de lucro que atualizou o stop loss
 
     for i in range(1, len(candles)-1):
         if np.isnan(ma_line.iloc[i]) or np.isnan(ma_line.iloc[i-1]):
             continue
-
-        if np.isinf(capital) or np.isnan(capital) or capital > MAX_CAPITAL:
-            break
 
         current_obv = obv.iloc[i]
         prev_obv = obv.iloc[i-1]
@@ -268,95 +244,309 @@ def run_strategy(
         if capital <= 0:
             break
 
-        trade_made = False
-
         if position == 0:
             if buy_signal or sell_signal:
-                # Alocação de capital com alavancagem fixa
-                current_position_leverage = leverage
-
-                allocated_capital = safe_alloc_cap(capital, used_capital_pct, current_position_leverage)
-                if allocated_capital is None:
-                    # Não conseguiu alocar com a alavancagem atual
-                    no_trade_steps += 1
-                    if no_trade_steps > MAX_NO_TRADE_STEPS:
-                        break
+                potential_allocated_capital = capital * used_capital_pct * leverage
+                if potential_allocated_capital <= 0:
                     continue
 
-                # Tentar abrir a posição
                 if buy_signal:
                     position = 1
                     entry_date = candles.index[i+1]
                     entry_price = next_open
-                    if entry_price == 0:
-                        no_trade_steps += 1
-                        if no_trade_steps > MAX_NO_TRADE_STEPS:
-                            break
-                        position = 0
-                        continue
-                    qty = allocated_capital / entry_price
-                    entry_fee = (entry_price * qty)*taker_fee
-                    capital -= entry_fee
-                    if np.isinf(capital) or np.isnan(capital) or capital > MAX_CAPITAL:
-                        break
-                    stop_loss = low.iloc[i+1]*(1 - stop_pct)
+                    stop_loss = low.iloc[i+1] * (1 - stop_pct)
+                    allocated_capital = potential_allocated_capital
+                    qty = allocated_capital / entry_price if entry_price != 0 else 0
                     max_price = entry_price
                     min_price = entry_price
-                    trade_made = True
+
+                    # Deduzir a taxa de corretagem na entrada
+                    entry_fee = allocated_capital * taker_fee
+                    capital -= entry_fee
+
+                    # Resetar Trailing Stop Variables
+                    trailing_step = 0
+                    last_trailing_update = 0
 
                 elif sell_signal:
                     position = -1
                     entry_date = candles.index[i+1]
                     entry_price = next_open
-                    if entry_price == 0:
-                        no_trade_steps += 1
-                        if no_trade_steps > MAX_NO_TRADE_STEPS:
-                            break
-                        position = 0
-                        continue
-                    qty = allocated_capital / entry_price
-                    entry_fee = (entry_price*qty)*taker_fee
-                    capital -= entry_fee
-                    if np.isinf(capital) or np.isnan(capital) or capital > MAX_CAPITAL:
-                        break
-                    stop_loss = high.iloc[i+1]*(1 + stop_pct)
+                    stop_loss = high.iloc[i+1] * (1 + stop_pct)
+                    allocated_capital = potential_allocated_capital
+                    qty = allocated_capital / entry_price if entry_price != 0 else 0
                     max_price = entry_price
                     min_price = entry_price
-                    trade_made = True
+
+                    # Deduzir a taxa de corretagem na entrada
+                    entry_fee = allocated_capital * taker_fee
+                    capital -= entry_fee
+
+                    # Resetar Trailing Stop Variables
+                    trailing_step = 0
+                    last_trailing_update = 0
 
         else:
-            # Aqui permanece a lógica normal quando já há posição aberta
-            # Por exemplo: verificar se o stop loss foi atingido ou se há sinal de inversão
-            # Implementação completa omitida para foco na remoção de alavancagem dinâmica
-            pass
+            if position == 1:
+                # Atualizar preços máximo e mínimo para monitorar drawdown
+                max_price = max(max_price, current_close)
+                min_price = min(min_price, candles['Low'].iloc[i])
 
-        if trade_made:
-            no_trade_steps = 0
-        else:
-            no_trade_steps += 1
-            if no_trade_steps > MAX_NO_TRADE_STEPS:
-                break
+                # Definir drawdown e drawup antes das condições
+                drawdown = ((entry_price - min_price) / entry_price * 100) if entry_price != 0 else 0
+                drawup = (max_price - entry_price) / entry_price * 100 if entry_price != 0 else 0
 
-    return trades, capital
+                # Calcular lucro atual
+                current_profit_pct = ((current_close - entry_price) / entry_price) * 100 if entry_price != 0 else 0
 
-def test_ma(ma, candles, initial_capital, used_capital_pct, leverage, taker_fee):
+                # Verificar se o lucro atingiu um novo nível de trailing stop
+                while current_profit_pct >= (last_trailing_update + 1):
+                    trailing_step += 1
+                    last_trailing_update += 1
+                    # Mover o stop loss para cima em 1%
+                    stop_loss = entry_price * (1 + (trailing_step * 0.01))
+
+                # Verificar se o stop loss foi atingido
+                if low.iloc[i+1] <= stop_loss:
+                    exit_price = next_open
+                    exit_date = candles.index[i+1]
+
+                    p_l = (exit_price - entry_price) * qty
+
+                    # Deduzir a taxa de corretagem na saída
+                    exit_fee = allocated_capital * taker_fee
+                    p_l -= exit_fee
+
+                    capital += p_l
+
+                    # Verificar liquidação
+                    if capital < 0:
+                        liquidations += 1
+                        capital = 0  # Resetar capital
+                        p_l = -allocated_capital  # Perda total da posição
+
+                    duration_minutes = (exit_date - entry_date).total_seconds() / 60.0
+
+                    trades.append({
+                        'Type': 'Long',
+                        'Entry Date': entry_date,
+                        'Entry Price': entry_price,
+                        'Exit Date': exit_date,
+                        'Exit Price': exit_price,
+                        'Profit (USD)': p_l,
+                        'Profit (%)': (p_l / allocated_capital) * 100 if allocated_capital != 0 else 0,  # Relativo ao capital alocado
+                        'Max Drawdown (%)': drawdown,
+                        'Max Drawup (%)': drawup,
+                        'Duration_minutes_raw': duration_minutes,
+                        'Duration': format_duration_minutes(duration_minutes),
+                        'Allocated Capital': allocated_capital,
+                        'Leverage': leverage  # Alavancagem fixa
+                    })
+
+                    position = 0
+                    entry_price = None
+                    entry_date = None
+                    stop_loss = None
+                    max_price = None
+                    min_price = None
+                    qty = None
+                    allocated_capital = None
+                    trailing_step = 0
+                    last_trailing_update = 0
+                    continue
+
+                # Verificar sinal de inversão para fechar posição Long e abrir Short
+                if sell_signal:
+                    exit_price = next_open
+                    exit_date = candles.index[i+1]
+
+                    p_l = (exit_price - entry_price) * qty
+
+                    # Deduzir a taxa de corretagem na saída
+                    exit_fee = allocated_capital * taker_fee
+                    p_l -= exit_fee
+
+                    capital += p_l
+
+                    duration_minutes = (exit_date - entry_date).total_seconds() / 60.0
+
+                    trades.append({
+                        'Type': 'Long',
+                        'Entry Date': entry_date,
+                        'Entry Price': entry_price,
+                        'Exit Date': exit_date,
+                        'Exit Price': exit_price,
+                        'Profit (USD)': p_l,
+                        'Profit (%)': (p_l / allocated_capital) * 100 if allocated_capital != 0 else 0,  # Relativo ao capital alocado
+                        'Max Drawdown (%)': drawdown,
+                        'Max Drawup (%)': drawup,
+                        'Duration_minutes_raw': duration_minutes,
+                        'Duration': format_duration_minutes(duration_minutes),
+                        'Allocated Capital': allocated_capital,
+                        'Leverage': leverage  # Alavancagem fixa
+                    })
+
+                    # Abrir posição Short
+                    position = -1
+                    entry_date = candles.index[i+1]
+                    entry_price = next_open
+                    stop_loss = high.iloc[i+1] * (1 + stop_pct)
+                    allocated_capital = capital * used_capital_pct * leverage
+                    qty = allocated_capital / entry_price if entry_price != 0 else 0
+
+                    # Deduzir a taxa de corretagem na entrada da nova posição
+                    entry_fee = allocated_capital * taker_fee
+                    capital -= entry_fee
+
+                    max_price = entry_price
+                    min_price = entry_price
+
+                    # Resetar Trailing Stop Variables
+                    trailing_step = 0
+                    last_trailing_update = 0
+                    continue
+
+            elif position == -1:
+                # Atualizar preços máximo e mínimo para monitorar drawdown
+                max_price = max(max_price, current_close)
+                min_price = min(min_price, candles['Low'].iloc[i])
+
+                # Definir drawdown e drawup antes das condições
+                drawdown = ((max_price - entry_price) / entry_price * 100) if entry_price != 0 else 0
+                drawup = ((entry_price - min_price) / entry_price * 100) if entry_price != 0 else 0
+
+                # Calcular lucro atual
+                current_profit_pct = ((entry_price - current_close) / entry_price) * 100 if entry_price != 0 else 0
+
+                # Verificar se o lucro atingiu um novo nível de trailing stop
+                while current_profit_pct >= (last_trailing_update + 1):
+                    trailing_step += 1
+                    last_trailing_update += 1
+                    # Mover o stop loss para baixo em 1%
+                    stop_loss = entry_price * (1 - (trailing_step * 0.01))
+
+                # Verificar se o stop loss foi atingido
+                if high.iloc[i+1] >= stop_loss:
+                    exit_price = next_open
+                    exit_date = candles.index[i+1]
+
+                    p_l = (entry_price - exit_price) * qty
+
+                    # Deduzir a taxa de corretagem na saída
+                    exit_fee = allocated_capital * taker_fee
+                    p_l -= exit_fee
+
+                    capital += p_l
+
+                    # Verificar liquidação
+                    if capital < 0:
+                        liquidations += 1
+                        capital = 0  # Resetar capital
+                        p_l = -allocated_capital  # Perda total da posição
+
+                    duration_minutes = (exit_date - entry_date).total_seconds() / 60.0
+
+                    trades.append({
+                        'Type': 'Short',
+                        'Entry Date': entry_date,
+                        'Entry Price': entry_price,
+                        'Exit Date': exit_date,
+                        'Exit Price': exit_price,
+                        'Profit (USD)': p_l,
+                        'Profit (%)': (p_l / allocated_capital) * 100 if allocated_capital != 0 else 0,  # Relativo ao capital alocado
+                        'Max Drawdown (%)': drawdown,
+                        'Max Drawup (%)': drawup,
+                        'Duration_minutes_raw': duration_minutes,
+                        'Duration': format_duration_minutes(duration_minutes),
+                        'Allocated Capital': allocated_capital,
+                        'Leverage': leverage  # Alavancagem fixa
+                    })
+
+                    position = 0
+                    entry_price = None
+                    entry_date = None
+                    stop_loss = None
+                    max_price = None
+                    min_price = None
+                    qty = None
+                    allocated_capital = None
+                    trailing_step = 0
+                    last_trailing_update = 0
+                    continue
+
+                # Verificar sinal de inversão para fechar posição Short e abrir Long
+                if buy_signal:
+                    exit_price = next_open
+                    exit_date = candles.index[i+1]
+
+                    p_l = (entry_price - exit_price) * qty
+
+                    # Deduzir a taxa de corretagem na saída
+                    exit_fee = allocated_capital * taker_fee
+                    p_l -= exit_fee
+
+                    capital += p_l
+
+                    duration_minutes = (exit_date - entry_date).total_seconds() / 60.0
+
+                    trades.append({
+                        'Type': 'Short',
+                        'Entry Date': entry_date,
+                        'Entry Price': entry_price,
+                        'Exit Date': exit_date,
+                        'Exit Price': exit_price,
+                        'Profit (USD)': p_l,
+                        'Profit (%)': (p_l / allocated_capital) * 100 if allocated_capital != 0 else 0,  # Relativo ao capital alocado
+                        'Max Drawdown (%)': drawdown,
+                        'Max Drawup (%)': drawup,
+                        'Duration_minutes_raw': duration_minutes,
+                        'Duration': format_duration_minutes(duration_minutes),
+                        'Allocated Capital': allocated_capital,
+                        'Leverage': leverage  # Alavancagem fixa
+                    })
+
+                    # Abrir posição Long
+                    position = 1
+                    entry_date = candles.index[i+1]
+                    entry_price = next_open
+                    stop_loss = low.iloc[i+1] * (1 - stop_pct)
+                    allocated_capital = capital * used_capital_pct * leverage
+                    qty = allocated_capital / entry_price if entry_price != 0 else 0
+
+                    # Deduzir a taxa de corretagem na entrada da nova posição
+                    entry_fee = allocated_capital * taker_fee
+                    capital -= entry_fee
+
+                    max_price = entry_price
+                    min_price = entry_price
+
+                    # Resetar Trailing Stop Variables
+                    trailing_step = 0
+                    last_trailing_update = 0
+                    continue
+
+    # Retornar também o número de liquidações
+    return trades, capital, liquidations
+
+def test_ma(ma, candles, initial_capital, used_capital_pct, leverage, taker_fee, periods):
     best_ma_period = None
     best_total_profit = -np.inf
     best_result_for_this_ma = None
     consecutive_worse = 0
     last_total_profit = -np.inf
+    tested_periods = 0
 
-    for ma_period in range(2, 21):
-        trades, final_capital = run_strategy(
+    for ma_period in periods:
+        trades, final_capital, liquidations = run_strategy(
             candles,
             initial_capital=initial_capital,
             used_capital_pct=used_capital_pct,
             leverage=leverage,
             ma_type=ma,
             ma_period=ma_period,
-            taker_fee=taker_fee,
-            previous_trades=[]
+            taker_fee=taker_fee
         )
+        tested_periods += 1  # Incrementa o contador de períodos testados
 
         if len(trades) > 0:
             df_trades = pd.DataFrame(trades)
@@ -368,12 +558,12 @@ def test_ma(ma, candles, initial_capital, used_capital_pct, leverage, taker_fee)
             total_profit = 0
 
         if np.isinf(total_profit) or np.isnan(total_profit):
-            break
+            continue
 
         if total_profit > best_total_profit:
             best_total_profit = total_profit
             best_ma_period = ma_period
-            best_result_for_this_ma = (ma, ma_period, trades, final_capital, best_total_profit)
+            best_result_for_this_ma = (ma, ma_period, trades, final_capital, best_total_profit, liquidations)
             consecutive_worse = 0
         else:
             if total_profit < last_total_profit:
@@ -385,31 +575,40 @@ def test_ma(ma, candles, initial_capital, used_capital_pct, leverage, taker_fee)
             break
 
     if best_result_for_this_ma is None:
-        best_result_for_this_ma = (ma, None, [], initial_capital, 0)
+        best_result_for_this_ma = (ma, None, [], initial_capital, 0, 0)
 
-    return best_result_for_this_ma
+    # Retorna também quantos períodos foram testados
+    return best_result_for_this_ma, tested_periods
 
 def format_number(n, suffix=""):
-    if n is None:
+    if n is None or (isinstance(n, float) and np.isnan(n)):
         return "N/A"
     return f"{n:,.2f}{suffix}"
 
 def val_pct(value):
-    return f"{value:,.2f}%" if value is not None else "N/A"
+    if isinstance(value, (int, float)):
+        return f"{value:,.2f}%"
+    return "N/A"
 
+# Protege a execução principal
 if __name__ == '__main__':
+    # Parâmetros iniciais
     csv_path = 'data/Coinbase/BTC-USD/1min/coinbase_BTC-USD_1m.csv'
-    timeframe_str = "210min"
-    initial_capital = 1.0
-    used_capital_pct = 0.01
-    leverage = 7  # Alavancagem fixa
-    taker_fee = 0.0004
+    timeframe_str = "30min"  # Ajustado para um timeframe menor para facilitar a análise
+    initial_capital = 100.0
+    used_capital_pct = 0.02  # Alterado de 0.4 para 0.02 conforme sua última configuração
+    leverage = 20  # Alavancagem fixa (reduzida para testes iniciais)
+    taker_fee = 0.0004  # Definição da taxa de corretagem
 
     ma_types = [
         'SMA', 'EMA', 'WMA', 'DEMA', 'TEMA', 'TRIMA', 'KAMA', 'MAMA', 'T3',
         'HT_TRENDLINE', 'RMA', 'ZLEMA', 'HMA', 'ALMA', 'WILDERS', 'LINREG',
         'FRAMA', 'JMA', 'SWMA', 'MEDIAN'
     ]
+
+    periods = range(2, 21)  # Períodos de 2 a 20
+    number_of_periods = len(periods)
+    total_steps = len(ma_types)  # Barra de progresso baseada no número de MAs
 
     candle_cache_path = get_cache_filename_for_candles(timeframe_str)
     if os.path.exists(candle_cache_path):
@@ -419,41 +618,69 @@ if __name__ == '__main__':
         df = read_csv_if_needed(csv_path)
         candles = read_and_cache_candles(df, timeframe_str)
 
-    print(f"\n\033[94mExecutando testes com diferentes MAs e períodos (paralelizado)...\033[0m")
+    # Limitar o volume de dados para testes (opcional)
+    # candles = candles.iloc[:10000]  # Descomente para limitar
 
-    total_steps = len(ma_types)
+    print(f"\n\033[94mExecutando testes com diferentes MAs e períodos...\033[0m")
 
     overall_results = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-        futures = {executor.submit(test_ma, ma, candles, initial_capital, used_capital_pct, leverage, taker_fee): ma for ma in ma_types}
+    tested_periods_total = 0
 
-        with tqdm(total=total_steps, desc="Processando resultados") as pbar:
-            for future in futures:
-                res = future.result()
-                overall_results.append(res)
-                pbar.update(1)
+    # Limitar o número de processos para evitar sobrecarga
+    max_workers = os.cpu_count() or 1  # Usa 1 se os.cpu_count() retornar None
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submeter tarefas para cada MA
+        futures = {executor.submit(test_ma, ma, candles, initial_capital, used_capital_pct, leverage, taker_fee, periods): ma for ma in ma_types}
+        
+        # Barra de progresso baseada no número de MAs
+        with tqdm(total=total_steps, desc="Processando MAs") as pbar:
+            for future in as_completed(futures):
+                ma = futures[future]
+                try:
+                    res, tested = future.result(timeout=300)  # Timeout de 5 minutos por tarefa
+                    overall_results.append(res)
+                    pbar.update(1)  # Incrementa a barra por MA completada
+                    tested_periods_total += tested
+                except Exception as e:
+                    print(f"Erro ao processar MA {ma}: {e}")
+                    pbar.update(1)  # Atualiza a barra mesmo em caso de erro
 
-    # Selecionar o melhor resultado global
+    if not overall_results:
+        print("Nenhum resultado foi obtido. Verifique as entradas e a lógica da estratégia.")
+        exit()
+
+    # Encontrar o melhor resultado global baseado no Total Profit
     best_global_result = max(overall_results, key=lambda x: x[4])
     best_ma = best_global_result[0]
     best_ma_period = best_global_result[1]
     trades = best_global_result[2]
     final_capital = best_global_result[3]
     total_profit = best_global_result[4]
+    total_liquidations = best_global_result[5]
 
     df_trades = pd.DataFrame(trades)
 
-    # Cálculo B&H líquido
-    bh_entry_fee = initial_capital * taker_fee
-    bh_capital_after_entry = initial_capital - bh_entry_fee
+    # Cálculo B&H líquido com alavancagem igual à estratégia para comparação justa
+    bh_allocated_capital = initial_capital * used_capital_pct * leverage
+    bh_entry_fee = bh_allocated_capital * taker_fee
+    bh_capital_after_entry = bh_allocated_capital - bh_entry_fee
     first_price = candles['Open'].iloc[0]
-    bh_qty = bh_capital_after_entry / first_price
+    bh_qty = bh_capital_after_entry / first_price if first_price != 0 else 0
     last_price = candles['Close'].iloc[-1]
     bh_final_equity = bh_qty * last_price
     bh_exit_fee = bh_final_equity * taker_fee
     bh_final_equity_net = bh_final_equity - bh_exit_fee
+
+    # **Correção 1: Definir Buy and Hold Profit em relação ao capital inicial**
     bh_profit = bh_final_equity_net - initial_capital
-    bh_profit_pct = (bh_profit / initial_capital)*100 if initial_capital != 0 else 0
+    bh_profit_pct = (bh_profit / initial_capital) * 100 if initial_capital != 0 else 0  # Relativo ao capital inicial
+
+    # **Correção 2: Calcular Strategy vs B&H com base no Buy and Hold Profit**
+    strategy_vs_bh_usd = total_profit - bh_profit
+    strategy_vs_bh_pct = (strategy_vs_bh_usd / bh_profit) * 100 if bh_profit != 0 else "N/A"
+
+    # Cálculo de Lucro Total Percentual Relativo ao Capital Inicial
+    total_profit_pct = (total_profit / initial_capital) * 100 if initial_capital != 0 else 0
 
     total_trades = len(df_trades)
     if total_trades > 0 and 'Profit (USD)' in df_trades.columns:
@@ -482,17 +709,39 @@ if __name__ == '__main__':
         max_profit_pct = 0
         min_profit_pct = 0
 
-    avg_profit_usd = profits.mean() if total_trades > 0 else 0
+    avg_profit_usd = total_profit / total_trades if total_trades > 0 else 0
     avg_profit_pct = df_trades['Profit (%)'].mean() if (total_trades > 0 and 'Profit (%)' in df_trades.columns) else 0
 
-    # Cálculo de Drawdown e Duração omitidos para foco na alavancagem fixa
+    # Cálculo de Drawdown e Duração
+    if total_trades > 0:
+        long_trades_df = df_trades[df_trades['Type'] == 'Long']
+        short_trades_df = df_trades[df_trades['Type'] == 'Short']
 
-    total_profit_pct = (total_profit / initial_capital) * 100 if initial_capital != 0 else 0
-    strategy_vs_bh_usd = (final_capital - initial_capital) - bh_profit
-    strategy_vs_bh_pct = (strategy_vs_bh_usd / abs(bh_profit)*100) if bh_profit != 0 else (100 if strategy_vs_bh_usd > 0 else 0)
+        max_dd_long = long_trades_df['Max Drawdown (%)'].max() if not long_trades_df.empty else "N/A"
+        avg_dd_long = long_trades_df['Max Drawdown (%)'].mean() if not long_trades_df.empty else "N/A"
 
+        max_dd_short = short_trades_df['Max Drawdown (%)'].max() if not short_trades_df.empty else "N/A"
+        avg_dd_short = short_trades_df['Max Drawdown (%)'].mean() if not short_trades_df.empty else "N/A"
+
+        durations_raw = df_trades['Duration_minutes_raw'] if ('Duration_minutes_raw' in df_trades.columns and total_trades > 0) else pd.Series([])
+        if not durations_raw.empty:
+            longest_duration = durations_raw.max()
+            shortest_duration = durations_raw.min()
+            avg_duration = durations_raw.mean()
+            longest_str = format_duration_minutes(longest_duration)
+            shortest_str = format_duration_minutes(shortest_duration)
+            avg_str = format_duration_minutes(avg_duration)
+        else:
+            longest_str = "00:00:00:00:00"
+            shortest_str = "00:00:00:00:00"
+            avg_str = "00:00:00:00:00"
+    else:
+        max_dd_long = avg_dd_long = max_dd_short = avg_dd_short = "N/A"
+        longest_str = shortest_str = avg_str = "00:00:00:00:00"
+
+    # Função para formatar porcentagens de trades
     def pct_of_total(n):
-        return val_pct((n/total_trades)*100 if total_trades > 0 else 0)
+        return val_pct((n / total_trades) * 100 if total_trades > 0 else 0)
 
     summary_data = [
         ["Timeframe", timeframe_str, "N/A"],
@@ -508,14 +757,19 @@ if __name__ == '__main__':
         ["Avg Profit per Trade", f"{format_number(avg_profit_usd, ' USD')}", val_pct(avg_profit_pct)],
         ["Max Profit (per trade)", f"{format_number(max_profit_usd, ' USD')}", val_pct(max_profit_pct)],
         ["Min Profit (per trade)", f"{format_number(min_profit_usd, ' USD')}", val_pct(min_profit_pct)],
-        ["Longest Operation Time", "N/A", "N/A"],
-        ["Shortest Operation Time", "N/A", "N/A"],
-        ["Average Operation Time", "N/A", "N/A"],
+        ["Max Drawdown (Long)", f"{format_number(max_dd_long, '%')}" if max_dd_long != "N/A" else "N/A", "N/A"],
+        ["Average Drawdown (Long)", f"{format_number(avg_dd_long, '%')}" if avg_dd_long != "N/A" else "N/A", "N/A"],
+        ["Max Drawdown (Short)", f"{format_number(max_dd_short, '%')}" if max_dd_short != "N/A" else "N/A", "N/A"],
+        ["Average Drawdown (Short)", f"{format_number(avg_dd_short, '%')}" if avg_dd_short != "N/A" else "N/A", "N/A"],
+        ["Longest Operation Time", longest_str, "N/A"],
+        ["Shortest Operation Time", shortest_str, "N/A"],
+        ["Average Operation Time", avg_str, "N/A"],
         ["Buy and Hold Profit", f"{format_number(bh_profit, ' USD')}", val_pct(bh_profit_pct)],
-        ["Strategy vs B&H", f"{format_number(strategy_vs_bh_usd, ' USD')}", val_pct(strategy_vs_bh_pct)],
-        ["Total Liquidations", "0", "0.00%"],
-        ["Long Liquidations", "0", "0.00%"],
-        ["Short Liquidations", "0", "0.00%"],
+        ["Strategy vs B&H", f"{format_number(strategy_vs_bh_usd, ' USD')}", val_pct(strategy_vs_bh_pct)],  # Linha corrigida
+        ["Leverage (Fixed)", f"{leverage}x", "N/A"],
+        ["Total Liquidations", f"{total_liquidations}", val_pct((total_liquidations / total_trades) * 100 if total_trades > 0 else 0)],
+        ["Long Liquidations", "0", "0.00%"],  # Implementar se necessário
+        ["Short Liquidations", "0", "0.00%"],  # Implementar se necessário
     ]
 
     print("\n\033[93mSummary:\033[0m")
