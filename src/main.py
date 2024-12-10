@@ -183,13 +183,12 @@ def run_strategy(
     used_capital_pct=0.01,
     leverage=None,
     ma_type='SMA',
-    ma_period=14,
+    ma_period=2,
     buy_condition=lambda prev_obv, prev_ma, current_obv, current_ma: (prev_obv > prev_ma and current_obv < current_ma),
     sell_condition=lambda prev_obv, prev_ma, current_obv, current_ma: (prev_obv < prev_ma and current_obv > current_ma),
     stop_pct=0.017,
     taker_fee=0.0004
 ):
-
     close = candles['Close'].astype('float64')
     volume = candles['Volume'].astype('float64')
     high = candles['High'].astype('float64')
@@ -198,10 +197,28 @@ def run_strategy(
     obv = pd.Series(ta.OBV(close.values, volume.values), index=close.index)
     ma_line = create_ma_line(obv, ma_type=ma_type, period=ma_period)
 
-    # Se leverage não é fornecida, usar 1.0 (nenhuma alavancagem)
-    dynamic_leverage = (leverage is None)
-    if leverage is None:
-        leverage = 1.0
+    # Listas para armazenar drawdowns históricos já realizados (por tipo de operação)
+    long_drawdowns = []
+    short_drawdowns = []
+
+    def calc_dynamic_leverage(trade_type):
+        # Calcula a alavancagem com base no max drawdown histórico do tipo
+        if trade_type == 'Long':
+            past_drawdowns = long_drawdowns
+        else:
+            past_drawdowns = short_drawdowns
+
+        if len(past_drawdowns) == 0:
+            # Sem histórico, alavancagem padrão
+            return 1.0
+
+        max_dd = max(past_drawdowns)
+        if max_dd == 0:
+            return 1.0
+
+        # menor número inteiro mais próximo de 100/max_dd
+        lev = round(100 / max_dd)
+        return max(1, lev)  # Garantir pelo menos 1
 
     position = 0
     capital = initial_capital
@@ -215,8 +232,9 @@ def run_strategy(
     qty = None
     allocated_capital = None
 
-    # Para acompanhamento da leverage se for dinâmica (aqui sempre 1.0 caso não informada)
-    leverage_used = []
+    # Armazena a alavancagem usada por tipo de operação
+    long_leverage_used = []
+    short_leverage_used = []
 
     for i in range(1, len(candles)-1):
         if np.isnan(ma_line.iloc[i]) or np.isnan(ma_line.iloc[i-1]):
@@ -235,44 +253,58 @@ def run_strategy(
 
         # Se o capital for <= 0, para de operar
         if capital <= 0:
+            print("Cessando operações por falta de capital.")
             break
 
         if position == 0:
-            # Alocação potencial
-            potential_allocated_capital = capital * used_capital_pct * leverage
-            if potential_allocated_capital <= 0:
-                # Se não há capital para operar
-                break
+            # Antes de abrir nova posição, verificar se há sinal e se há capital
+            if buy_signal or sell_signal:
+                # Se leverage é None, calcular dinamicamente
+                if leverage is None:
+                    if buy_signal:
+                        current_leverage = calc_dynamic_leverage('Long')
+                    else:
+                        current_leverage = calc_dynamic_leverage('Short')
+                else:
+                    current_leverage = leverage
 
-            if buy_signal:
-                position = 1
-                entry_date = candles.index[i+1]
-                entry_price = next_open
-                stop_loss = low.iloc[i+1] * (1 - stop_pct)
+                potential_allocated_capital = capital * used_capital_pct * current_leverage
+                if potential_allocated_capital <= 0:
+                    print("Cessando operações por falta de capital alocável.")
+                    break
 
-                allocated_capital = capital * used_capital_pct * leverage
-                qty = allocated_capital / entry_price if entry_price != 0 else 0
+                if buy_signal:
+                    position = 1
+                    entry_date = candles.index[i+1]
+                    entry_price = next_open
+                    stop_loss = low.iloc[i+1] * (1 - stop_pct)
 
-                max_price = entry_price
-                min_price = entry_price
+                    allocated_capital = capital * used_capital_pct * current_leverage
+                    qty = allocated_capital / entry_price if entry_price != 0 else 0
 
-                leverage_used.append(leverage)
+                    max_price = entry_price
+                    min_price = entry_price
 
-            elif sell_signal:
-                position = -1
-                entry_date = candles.index[i+1]
-                entry_price = next_open
-                stop_loss = high.iloc[i+1] * (1 + stop_pct)
+                    long_leverage_used.append(current_leverage)
 
-                allocated_capital = capital * used_capital_pct * leverage
-                qty = allocated_capital / entry_price if entry_price != 0 else 0
+                elif sell_signal:
+                    position = -1
+                    entry_date = candles.index[i+1]
+                    entry_price = next_open
+                    stop_loss = high.iloc[i+1] * (1 + stop_pct)
 
-                max_price = entry_price
-                min_price = entry_price
+                    allocated_capital = capital * used_capital_pct * current_leverage
+                    qty = allocated_capital / entry_price if entry_price != 0 else 0
 
-                leverage_used.append(leverage)
+                    max_price = entry_price
+                    min_price = entry_price
+
+                    short_leverage_used.append(current_leverage)
+
+                current_position_leverage = current_leverage
 
         else:
+            # Gerenciamento da posição
             if position == 1:
                 if current_close > max_price:
                     max_price = current_close
@@ -306,8 +338,11 @@ def run_strategy(
                         'Duration_minutes_raw': duration_minutes,
                         'Duration': format_duration_minutes(duration_minutes),
                         'Allocated Capital': allocated_capital,
-                        'Leverage': leverage
+                        'Leverage': current_position_leverage
                     })
+
+                    # Adicionar drawdown ao histórico de long
+                    long_drawdowns.append(drawdown)
 
                     position = 0
                     entry_price = None
@@ -346,15 +381,25 @@ def run_strategy(
                         'Duration_minutes_raw': duration_minutes,
                         'Duration': format_duration_minutes(duration_minutes),
                         'Allocated Capital': allocated_capital,
-                        'Leverage': leverage
+                        'Leverage': current_position_leverage
                     })
 
-                    # Abre short
-                    # Verificar capital antes de abrir nova posição
+                    # Adicionar drawdown ao histórico de long
+                    long_drawdowns.append(drawdown)
+
+                    # Abre short (verificando capital novamente)
                     if capital <= 0:
+                        print("Cessando operações por falta de capital.")
                         break
-                    potential_allocated_capital = capital * used_capital_pct * leverage
+                    # Calcular nova alavancagem se leverage for None
+                    if leverage is None:
+                        current_leverage = calc_dynamic_leverage('Short')
+                    else:
+                        current_leverage = leverage
+
+                    potential_allocated_capital = capital * used_capital_pct * current_leverage
                     if potential_allocated_capital <= 0:
+                        print("Cessando operações por falta de capital alocável.")
                         break
 
                     position = -1
@@ -362,13 +407,14 @@ def run_strategy(
                     entry_price = next_open
                     stop_loss = high.iloc[i+1] * (1 + stop_pct)
 
-                    allocated_capital = capital * used_capital_pct * leverage
+                    allocated_capital = capital * used_capital_pct * current_leverage
                     qty = allocated_capital / entry_price if entry_price != 0 else 0
 
                     max_price = entry_price
                     min_price = entry_price
 
-                    leverage_used.append(leverage)
+                    short_leverage_used.append(current_leverage)
+                    current_position_leverage = current_leverage
 
             elif position == -1:
                 if current_close > max_price:
@@ -403,8 +449,11 @@ def run_strategy(
                         'Duration_minutes_raw': duration_minutes,
                         'Duration': format_duration_minutes(duration_minutes),
                         'Allocated Capital': allocated_capital,
-                        'Leverage': leverage
+                        'Leverage': current_position_leverage
                     })
+
+                    # Adicionar drawdown ao histórico de short
+                    short_drawdowns.append(drawdown)
 
                     position = 0
                     entry_price = None
@@ -443,14 +492,26 @@ def run_strategy(
                         'Duration_minutes_raw': duration_minutes,
                         'Duration': format_duration_minutes(duration_minutes),
                         'Allocated Capital': allocated_capital,
-                        'Leverage': leverage
+                        'Leverage': current_position_leverage
                     })
+
+                    # Adicionar drawdown ao histórico de short
+                    short_drawdowns.append(drawdown)
 
                     # Abre Long
                     if capital <= 0:
+                        print("Cessando operações por falta de capital.")
                         break
-                    potential_allocated_capital = capital * used_capital_pct * leverage
+
+                    # Calcular nova alavancagem se leverage for None
+                    if leverage is None:
+                        current_leverage = calc_dynamic_leverage('Long')
+                    else:
+                        current_leverage = leverage
+
+                    potential_allocated_capital = capital * used_capital_pct * current_leverage
                     if potential_allocated_capital <= 0:
+                        print("Cessando operações por falta de capital alocável.")
                         break
 
                     position = 1
@@ -458,30 +519,29 @@ def run_strategy(
                     entry_price = next_open
                     stop_loss = low.iloc[i+1] * (1 - stop_pct)
 
-                    allocated_capital = capital * used_capital_pct * leverage
+                    allocated_capital = capital * used_capital_pct * current_leverage
                     qty = allocated_capital / entry_price if entry_price != 0 else 0
 
                     max_price = entry_price
                     min_price = entry_price
 
-                    leverage_used.append(leverage)
+                    long_leverage_used.append(current_leverage)
+                    current_position_leverage = current_leverage
 
-    return trades, capital, leverage_used, dynamic_leverage
+    return trades, capital, long_leverage_used, short_leverage_used
 
 def format_number(n, suffix=""):
     return f"{n:,.2f}{suffix}"
 
 if __name__ == '__main__':
+    # Exemplo de parâmetros
     csv_path = 'data/Coinbase/BTC-USD/1min/coinbase_BTC-USD_1m.csv'
-    timeframe_str = "210min"
-
-    # Parâmetros de exemplo
-    initial_capital = 1000.0
-    used_capital_pct = 0.02
-    # leverage = 2.0  # Descomente se quiser fixa
-    leverage = None   # Para demonstrar o caso dinâmico (que assume 1.0)
-    ma_type = 'EMA'
-    ma_period = 20
+    timeframe_str = "1w"
+    initial_capital = 100.0
+    used_capital_pct = 0.05
+    leverage = 1   # Dinâmico
+    ma_type = 'SMA'
+    ma_period = 2
 
     candle_cache_path = get_cache_filename_for_candles(timeframe_str)
     if os.path.exists(candle_cache_path):
@@ -491,7 +551,7 @@ if __name__ == '__main__':
         df = read_csv_if_needed(csv_path)
         candles = read_and_cache_candles(df, timeframe_str)
 
-    trades, final_capital, leverage_used, dynamic_leverage = run_strategy(
+    trades, final_capital, long_leverage_used, short_leverage_used = run_strategy(
         candles,
         initial_capital=initial_capital,
         used_capital_pct=used_capital_pct,
@@ -571,6 +631,21 @@ if __name__ == '__main__':
         def pct_of_total(n):
             return val_pct((n/total_trades)*100 if total_trades > 0 else 0)
 
+        # Métricas de alavancagem
+        if long_leverage_used:
+            min_lev_long = np.min(long_leverage_used)
+            max_lev_long = np.max(long_leverage_used)
+            avg_lev_long = np.mean(long_leverage_used)
+        else:
+            min_lev_long = max_lev_long = avg_lev_long = None
+
+        if short_leverage_used:
+            min_lev_short = np.min(short_leverage_used)
+            max_lev_short = np.max(short_leverage_used)
+            avg_lev_short = np.mean(short_leverage_used)
+        else:
+            min_lev_short = max_lev_short = avg_lev_short = None
+
         summary_data = [
             ["Total Trades", f"{total_trades}", "100.00%"],
             ["Long Trades", f"{num_long}", pct_of_total(num_long)],
@@ -590,13 +665,18 @@ if __name__ == '__main__':
             ["Shortest Operation Time", shortest_str, "N/A"],
             ["Average Operation Time", avg_str, "N/A"],
             ["Buy and Hold Profit", f"{format_number(bh_profit, ' USD')}", val_pct(bh_profit_pct)],
-            ["Strategy vs B&H", f"{format_number(strategy_vs_bh_usd, ' USD')}", val_pct(strategy_vs_bh_pct)]
+            ["Strategy vs B&H", f"{format_number(strategy_vs_bh_usd, ' USD')}", val_pct(strategy_vs_bh_pct)],
+            ["Min Leverage (Long)", f"{format_number(min_lev_long, 'x') if min_lev_long is not None else 'N/A'}", "N/A"],
+            ["Max Leverage (Long)", f"{format_number(max_lev_long, 'x') if max_lev_long is not None else 'N/A'}", "N/A"],
+            ["Average Leverage (Long)", f"{format_number(avg_lev_long, 'x') if avg_lev_long is not None else 'N/A'}", "N/A"],
+            ["Min Leverage (Short)", f"{format_number(min_lev_short, 'x') if min_lev_short is not None else 'N/A'}", "N/A"],
+            ["Max Leverage (Short)", f"{format_number(max_lev_short, 'x') if max_lev_short is not None else 'N/A'}", "N/A"],
+            ["Average Leverage (Short)", f"{format_number(avg_lev_short, 'x') if avg_lev_short is not None else 'N/A'}", "N/A"],
         ]
 
         print("\nSummary:")
         print(tabulate(summary_data, headers=["Metric", "Value (Abs)", "Value (%)"], tablefmt="grid", showindex=False))
 
-        # Most Representative Trades com formatação
         def format_trade_row(row):
             return {
                 'Type': row['Type'],
@@ -605,7 +685,8 @@ if __name__ == '__main__':
                 'Exit Date': row['Exit Date'],
                 'Exit Price': format_number(row['Exit Price'], ''),
                 'Profit (USD)': format_number(row['Profit (USD)'], ''),
-                'Profit (%)': val_pct(row['Profit (%)'])
+                'Profit (%)': val_pct(row['Profit (%)']),
+                'Leverage': f"{row['Leverage']:.2f}x"
             }
 
         best_trade_formatted = format_trade_row(max_profit_row)
@@ -618,16 +699,6 @@ if __name__ == '__main__':
 
         print("\nWorst Trade:")
         print(tabulate(pd.DataFrame([worst_trade_formatted]), headers="keys", tablefmt="grid", showindex=False))
-
-        # Se a alavancagem não foi informada (dinâmica), mostrar max, avg, min
-        if dynamic_leverage and leverage_used:
-            max_lev = np.max(leverage_used)
-            min_lev = np.min(leverage_used)
-            avg_lev = np.mean(leverage_used)
-            print("\nLeverage Statistics (Dynamic):")
-            print(f"Max Leverage: {max_lev:.2f}x")
-            print(f"Min Leverage: {min_lev:.2f}x")
-            print(f"Average Leverage: {avg_lev:.2f}x")
 
     else:
         print("Nenhuma trade foi realizada pela estratégia.")
