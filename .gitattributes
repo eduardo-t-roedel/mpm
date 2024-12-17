@@ -1,2 +1,4 @@
 data/Coinbase/BTC-USD/1min/coinbase_BTC-USD_1m.csv filter=lfs diff=lfs merge=lfs -text
 original_data.parquet filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
