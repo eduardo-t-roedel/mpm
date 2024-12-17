@@ -57,10 +57,10 @@ def read_and_cache_candles(df, timeframe_str):
 
 def create_candles(df, timeframe_str):
     units_map = {
-        'min': 'T',  # 'T' é o alias do pandas para minutos
-        'h': 'H',
-        'd': 'D',
-        'w': 'W',
+        'min': 'min',
+        'h': 'h',
+        'd': 'd',
+        'w': 'w',
         'm': 'M',
         'y': 'Y'
     }
@@ -594,11 +594,11 @@ def val_pct(value):
 if __name__ == '__main__':
     # Parâmetros iniciais
     csv_path = 'data/Coinbase/BTC-USD/1min/coinbase_BTC-USD_1m.csv'
-    timeframe_str = "30min"  # Ajustado para um timeframe menor para facilitar a análise
+    timeframe_str = "25min"  
     initial_capital = 100.0
-    used_capital_pct = 0.02  # Alterado de 0.4 para 0.02 conforme sua última configuração
-    leverage = 20  # Alavancagem fixa (reduzida para testes iniciais)
-    taker_fee = 0.0004  # Definição da taxa de corretagem
+    used_capital_pct = 0.02  
+    leverage = 20  
+    taker_fee = 0.0004  
 
     ma_types = [
         'SMA', 'EMA', 'WMA', 'DEMA', 'TEMA', 'TRIMA', 'KAMA', 'MAMA', 'T3',
