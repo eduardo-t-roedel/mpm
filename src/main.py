@@ -603,7 +603,7 @@ if __name__ == '__main__':
     ma_types = [
         'SMA', 'EMA', 'WMA', 'DEMA', 'TEMA', 'TRIMA', 'KAMA', 'MAMA', 'T3',
         'HT_TRENDLINE', 'RMA', 'ZLEMA', 'HMA', 'ALMA', 'WILDERS', 'LINREG',
-        'FRAMA', 'JMA', 'SWMA', 'MEDIAN'
+        'MEDIAN', 'FRAMA', 'JMA', 'SWMA'
     ]
 
     periods = range(2, 21)  # Períodos de 2 a 20
